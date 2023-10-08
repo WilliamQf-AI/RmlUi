@@ -183,8 +183,11 @@ void RenderManager::ApplyClipMask(const ClipMaskGeometryList& clip_elements)
 		{
 			RMLUI_ASSERT(element_clip.geometry->render_manager == this);
 			SetTransform(element_clip.transform);
-			if (CompiledGeometryHandle handle = GetCompiledGeometryHandle(element_clip.geometry->resource_handle))
+			bool compile_attempted = false;
+			if (CompiledGeometryHandle handle = GetCompiledGeometryHandle(element_clip.geometry->resource_handle, compile_attempted))
 				render_interface->RenderToClipMask(element_clip.operation, handle, element_clip.absolute_offset);
+			else if (compile_attempted)
+				LogCompileGeometryError();
 		}
 
 		// Apply the initially set transform in case it was changed.
@@ -211,8 +214,9 @@ StableVectorIndex RenderManager::InsertGeometry(Mesh&& mesh)
 	return geometry_list.insert(GeometryData{std::move(mesh), CompiledGeometryHandle{}});
 }
 
-CompiledGeometryHandle RenderManager::GetCompiledGeometryHandle(StableVectorIndex index)
+CompiledGeometryHandle RenderManager::GetCompiledGeometryHandle(StableVectorIndex index, bool& compile_attempted)
 {
+	compile_attempted = false;
 	if (index == StableVectorIndex::Invalid)
 		return {};
 
@@ -221,6 +225,7 @@ CompiledGeometryHandle RenderManager::GetCompiledGeometryHandle(StableVectorInde
 	{
 		geometry.handle = render_interface->CompileGeometry(geometry.mesh.vertices.data(), (int)geometry.mesh.vertices.size(),
 			geometry.mesh.indices.data(), (int)geometry.mesh.indices.size());
+		compile_attempted = true;
 	}
 	return geometry.handle;
 }
@@ -234,18 +239,29 @@ void RenderManager::Render(const Geometry& geometry, Vector2f translation, Textu
 		return;
 	}
 
-	if (CompiledGeometryHandle geometry_handle = GetCompiledGeometryHandle(geometry.resource_handle))
-	{
-		TextureHandle texture_handle = {};
-		if (texture.file_index != TextureFileIndex::Invalid)
-			texture_handle = texture_database->file_database.GetHandle(texture.file_index);
-		else if (texture.callback_index != StableVectorIndex::Invalid)
-			texture_handle = texture_database->callback_database.GetHandle(this, render_interface, texture.callback_index);
+	TextureHandle texture_handle = {};
+	if (texture.file_index != TextureFileIndex::Invalid)
+		texture_handle = texture_database->file_database.GetHandle(texture.file_index);
+	else if (texture.callback_index != StableVectorIndex::Invalid)
+		texture_handle = texture_database->callback_database.GetHandle(this, render_interface, texture.callback_index);
 
+	bool compile_attempted = false;
+	if (CompiledGeometryHandle geometry_handle = GetCompiledGeometryHandle(geometry.resource_handle, compile_attempted))
+	{
 		if (shader)
 			render_interface->RenderShader(shader.resource_handle, geometry_handle, translation, texture_handle);
 		else
 			render_interface->RenderCompiledGeometry(geometry_handle, translation, texture_handle);
+	}
+	else if (compile_attempted && !shader)
+	{
+		GeometryData& data = geometry_list[geometry.resource_handle];
+		render_interface->RenderGeometry(data.mesh.vertices.data(), (int)data.mesh.vertices.size(), data.mesh.indices.data(),
+			(int)data.mesh.indices.size(), texture_handle, translation);
+	}
+	else if (compile_attempted)
+	{
+		LogCompileGeometryError();
 	}
 }
 
@@ -349,6 +365,15 @@ void RenderManager::ReleaseResource(const CompiledShader& shader)
 
 	render_interface->ReleaseCompiledShader(shader.resource_handle);
 	compiled_shader_count -= 1;
+}
+
+void RenderManager::LogCompileGeometryError()
+{
+	if (!logged_compile_geometry_error)
+	{
+		logged_compile_geometry_error = true;
+		Log::Message(Log::LT_ERROR, "Could not compile geometry, which is required for rendering clip masks and shaders.");
+	}
 }
 
 } // namespace Rml
